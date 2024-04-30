@@ -92,7 +92,15 @@ message AggExpr {
     BitAndAgg bitAndAgg = 9;
     BitOrAgg bitOrAgg = 10;
     BitXorAgg bitXorAgg = 11;
+    CovSample covSample = 12;
+    CovPopulation covPopulation = 13;
+    Variance variance = 14;
   }
+}
+
+enum StatisticsType {
+  SAMPLE = 0;
+  POPULATION = 1;
 }
 
 message Count {
@@ -147,6 +155,27 @@ message BitOrAgg {
 message BitXorAgg {
   Expr child = 1;
   DataType datatype = 2;
+}
+
+message CovSample {
+  Expr child1 = 1;
+  Expr child2 = 2;
+  bool null_on_divide_by_zero = 3;
+  DataType datatype = 4;
+}
+
+message CovPopulation {
+  Expr child1 = 1;
+  Expr child2 = 2;
+  bool null_on_divide_by_zero = 3;
+  DataType datatype = 4;
+}
+
+message Variance {
+  Expr child = 1;
+  bool null_on_divide_by_zero = 2;
+  DataType datatype = 3;
+  StatisticsType stats_type = 4;
 }
 
 message Literal {
@@ -208,6 +237,8 @@ message Cast {
   Expr child = 1;
   DataType datatype = 2;
   string timezone = 3;
+  // LEGACY, ANSI, or TRY
+  string eval_mode = 4;
 }
 
 message Equal {

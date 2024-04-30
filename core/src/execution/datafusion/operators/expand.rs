@@ -15,17 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_array::RecordBatch;
+use arrow_array::{RecordBatch, RecordBatchOptions};
 use arrow_schema::SchemaRef;
 use datafusion::{
     execution::TaskContext,
     physical_plan::{
-        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, RecordBatchStream,
-        SendableRecordBatchStream,
+        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
+        RecordBatchStream, SendableRecordBatchStream,
     },
 };
 use datafusion_common::DataFusionError;
-use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
+use datafusion_physical_expr::{EquivalenceProperties, PhysicalExpr};
 use futures::{Stream, StreamExt};
 use std::{
     any::Any,
@@ -41,6 +41,7 @@ pub struct CometExpandExec {
     projections: Vec<Vec<Arc<dyn PhysicalExpr>>>,
     child: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
+    cache: PlanProperties,
 }
 
 impl CometExpandExec {
@@ -50,10 +51,17 @@ impl CometExpandExec {
         child: Arc<dyn ExecutionPlan>,
         schema: SchemaRef,
     ) -> Self {
+        let cache = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        );
+
         Self {
             projections,
             child,
             schema,
+            cache,
         }
     }
 }
@@ -88,14 +96,6 @@ impl ExecutionPlan for CometExpandExec {
         self.schema.clone()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        Partitioning::UnknownPartitioning(1)
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        None
-    }
-
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![self.child.clone()]
     }
@@ -121,6 +121,10 @@ impl ExecutionPlan for CometExpandExec {
         let expand_stream =
             ExpandStream::new(self.projections.clone(), child_stream, self.schema.clone());
         Ok(Box::pin(expand_stream))
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 }
 
@@ -165,7 +169,9 @@ impl ExpandStream {
             Ok::<(), DataFusionError>(())
         })?;
 
-        RecordBatch::try_new(self.schema.clone(), columns).map_err(|e| e.into())
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        RecordBatch::try_new_with_options(self.schema.clone(), columns, &options)
+            .map_err(|e| e.into())
     }
 }
 

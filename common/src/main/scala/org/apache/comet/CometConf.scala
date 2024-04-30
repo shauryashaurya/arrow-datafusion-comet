@@ -19,7 +19,11 @@
 
 package org.apache.comet
 
+import java.io.{BufferedOutputStream, FileOutputStream}
 import java.util.concurrent.TimeUnit
+
+import scala.collection.mutable.ListBuffer
+import scala.io.Source
 
 import org.apache.spark.network.util.ByteUnit
 import org.apache.spark.network.util.JavaUtils
@@ -39,6 +43,14 @@ import org.apache.spark.sql.internal.SQLConf
  * can also explicitly pass a [[SQLConf]] object to the `get` method.
  */
 object CometConf {
+
+  /** List of all configs that is used for generating documentation */
+  val allConfs = new ListBuffer[ConfigEntry[_]]
+
+  def register(conf: ConfigEntryWithDefault[_]): Unit = {
+    allConfs.append(conf)
+  }
+
   def conf(key: String): ConfigBuilder = ConfigBuilder(key)
 
   val COMET_EXEC_CONFIG_PREFIX = "spark.comet.exec";
@@ -139,12 +151,13 @@ object CometConf {
     .booleanConf
     .createWithDefault(false)
 
-  val COMET_EXEC_BROADCAST_ENABLED: ConfigEntry[Boolean] =
+  val COMET_EXEC_BROADCAST_FORCE_ENABLED: ConfigEntry[Boolean] =
     conf(s"$COMET_EXEC_CONFIG_PREFIX.broadcast.enabled")
       .doc(
-        "Whether to enable broadcasting for Comet native operators. By default, " +
-          "this config is false. Note that this feature is not fully supported yet " +
-          "and only enabled for test purpose.")
+        "Whether to force enabling broadcasting for Comet native operators. By default, " +
+          "this config is false. Comet broadcast feature will be enabled automatically by " +
+          "Comet extension. But for unit tests, we need this feature to force enabling it " +
+          "for invalid cases. So this config is only used for unit test.")
       .booleanConf
       .createWithDefault(false)
 
@@ -336,6 +349,40 @@ object CometConf {
         "enabled when reading from Iceberg tables.")
     .booleanConf
     .createWithDefault(false)
+
+  val COMET_ROW_TO_COLUMNAR_ENABLED: ConfigEntry[Boolean] =
+    conf("spark.comet.rowToColumnar.enabled")
+      .internal()
+      .doc("Whether to enable row to columnar conversion in Comet. When this is turned on, " +
+        "Comet will convert row-based operators in " +
+        "`spark.comet.rowToColumnar.supportedOperatorList` into columnar based before processing.")
+      .booleanConf
+      .createWithDefault(false)
+
+  val COMET_ROW_TO_COLUMNAR_SUPPORTED_OPERATOR_LIST: ConfigEntry[Seq[String]] =
+    conf("spark.comet.rowToColumnar.supportedOperatorList")
+      .doc(
+        "A comma-separated list of row-based operators that will be converted to columnar " +
+          "format when 'spark.comet.rowToColumnar.enabled' is true")
+      .stringConf
+      .toSequence
+      .createWithDefault(Seq("Range,InMemoryTableScan"))
+
+  val COMET_ANSI_MODE_ENABLED: ConfigEntry[Boolean] = conf("spark.comet.ansi.enabled")
+    .doc(
+      "Comet does not respect ANSI mode in most cases and by default will not accelerate " +
+        "queries when ansi mode is enabled. Enable this setting to test Comet's experimental " +
+        "support for ANSI mode. This should not be used in production.")
+    .booleanConf
+    .createWithDefault(false)
+
+  val COMET_CAST_STRING_TO_TIMESTAMP: ConfigEntry[Boolean] = conf(
+    "spark.comet.cast.stringToTimestamp")
+    .doc(
+      "Comet is not currently fully compatible with Spark when casting from String to Timestamp.")
+    .booleanConf
+    .createWithDefault(false)
+
 }
 
 object ConfigHelpers {
@@ -439,7 +486,7 @@ private class TypedConfigBuilder[T](
   /** Creates a [[ConfigEntry]] that has a default value. */
   def createWithDefault(default: T): ConfigEntry[T] = {
     val transformedDefault = converter(stringConverter(default))
-    new ConfigEntryWithDefault[T](
+    val conf = new ConfigEntryWithDefault[T](
       parent.key,
       transformedDefault,
       converter,
@@ -447,6 +494,8 @@ private class TypedConfigBuilder[T](
       parent._doc,
       parent._public,
       parent._version)
+    CometConf.register(conf)
+    conf
   }
 }
 
@@ -575,4 +624,37 @@ private[comet] case class ConfigBuilder(key: String) {
 
 private object ConfigEntry {
   val UNDEFINED = "<undefined>"
+}
+
+/**
+ * Utility for generating markdown documentation from the configs.
+ *
+ * This is invoked when running `mvn clean package -DskipTests`.
+ */
+object CometConfGenerateDocs {
+  def main(args: Array[String]): Unit = {
+    if (args.length != 2) {
+      // scalastyle:off println
+      println("Missing arguments for template file and output file")
+      // scalastyle:on println
+      sys.exit(-1)
+    }
+    val templateFilename = args.head
+    val outputFilename = args(1)
+    val w = new BufferedOutputStream(new FileOutputStream(outputFilename))
+    for (line <- Source.fromFile(templateFilename).getLines()) {
+      if (line.trim == "<!--CONFIG_TABLE-->") {
+        val publicConfigs = CometConf.allConfs.filter(_.isPublic)
+        val confs = publicConfigs.sortBy(_.key)
+        w.write("| Config | Description | Default Value |\n".getBytes)
+        w.write("|--------|-------------|---------------|\n".getBytes)
+        for (conf <- confs) {
+          w.write(s"| ${conf.key} | ${conf.doc.trim} | ${conf.defaultValueString} |\n".getBytes)
+        }
+      } else {
+        w.write(s"${line.trim}\n".getBytes)
+      }
+    }
+    w.close()
+  }
 }

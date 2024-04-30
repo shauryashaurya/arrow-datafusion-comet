@@ -28,7 +28,7 @@ import org.apache.spark.sql.{CometTestBase, DataFrame, Row}
 import org.apache.spark.sql.catalyst.optimizer.EliminateSorts
 import org.apache.spark.sql.comet.CometHashAggregateExec
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
-import org.apache.spark.sql.functions.sum
+import org.apache.spark.sql.functions.{count_distinct, sum}
 import org.apache.spark.sql.internal.SQLConf
 
 import org.apache.comet.CometConf
@@ -39,6 +39,87 @@ import org.apache.comet.CometSparkSessionExtensions.isSpark34Plus
  */
 class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
   import testImplicits._
+
+  test("count with aggregation filter") {
+    withSQLConf(
+      CometConf.COMET_ENABLED.key -> "true",
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "true") {
+      val df1 = sql("SELECT count(DISTINCT 2), count(DISTINCT 2,3)")
+      checkSparkAnswer(df1)
+
+      val df2 = sql("SELECT count(DISTINCT 2), count(DISTINCT 3,2)")
+      checkSparkAnswer(df2)
+    }
+  }
+
+  test("lead/lag should return the default value if the offset row does not exist") {
+    withSQLConf(
+      CometConf.COMET_ENABLED.key -> "true",
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "true") {
+      checkSparkAnswer(sql("""
+                             |SELECT
+                             |  lag(123, 100, 321) OVER (ORDER BY id) as lag,
+                             |  lead(123, 100, 321) OVER (ORDER BY id) as lead
+                             |FROM (SELECT 1 as id) tmp
+      """.stripMargin))
+
+      checkSparkAnswer(sql("""
+                             |SELECT
+                             |  lag(123, 100, a) OVER (ORDER BY id) as lag,
+                             |  lead(123, 100, a) OVER (ORDER BY id) as lead
+                             |FROM (SELECT 1 as id, 2 as a) tmp
+      """.stripMargin))
+    }
+  }
+
+  test("multiple column distinct count") {
+    withSQLConf(
+      CometConf.COMET_ENABLED.key -> "true",
+      CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+      CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "true") {
+      val df1 = Seq(
+        ("a", "b", "c"),
+        ("a", "b", "c"),
+        ("a", "b", "d"),
+        ("x", "y", "z"),
+        ("x", "q", null.asInstanceOf[String]))
+        .toDF("key1", "key2", "key3")
+
+      checkSparkAnswer(df1.agg(count_distinct($"key1", $"key2")))
+      checkSparkAnswer(df1.agg(count_distinct($"key1", $"key2", $"key3")))
+      checkSparkAnswer(df1.groupBy($"key1").agg(count_distinct($"key2", $"key3")))
+    }
+  }
+
+  test("Only trigger Comet Final aggregation on Comet partial aggregation") {
+    withTempView("lowerCaseData") {
+      lowerCaseData.createOrReplaceTempView("lowerCaseData")
+      withSQLConf(
+        CometConf.COMET_ENABLED.key -> "true",
+        CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+        CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "true") {
+        val df = sql("SELECT LAST(n) FROM lowerCaseData")
+        checkSparkAnswer(df)
+      }
+    }
+  }
+
+  test(
+    "Average expression in Comet Final should handle " +
+      "all null inputs from partial Spark aggregation") {
+    withTempView("allNulls") {
+      allNulls.createOrReplaceTempView("allNulls")
+      withSQLConf(
+        CometConf.COMET_ENABLED.key -> "true",
+        CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
+        CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "true") {
+        val df = sql("select sum(a), avg(a) from allNulls")
+        checkSparkAnswer(df)
+      }
+    }
+  }
 
   test("Aggregation without aggregate expressions should use correct result expressions") {
     withSQLConf(
@@ -997,9 +1078,100 @@ class CometAggregateSuite extends CometTestBase with AdaptiveSparkPlanHelper {
     }
   }
 
+  test("covar_pop and covar_samp") {
+    withSQLConf(CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true") {
+      Seq(true, false).foreach { cometColumnShuffleEnabled =>
+        withSQLConf(
+          CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> cometColumnShuffleEnabled.toString) {
+          Seq(true, false).foreach { dictionary =>
+            withSQLConf("parquet.enable.dictionary" -> dictionary.toString) {
+              val table = "test"
+              withTable(table) {
+                sql(
+                  s"create table $table(col1 int, col2 int, col3 int, col4 float, col5 double," +
+                    " col6 double, col7 int) using parquet")
+                sql(s"insert into $table values(1, 4, null, 1.1, 2.2, null, 1)," +
+                  " (2, 5, 6, 3.4, 5.6, null, 1), (3, 6, null, 7.9, 2.4, null, 2)")
+                val expectedNumOfCometAggregates = 2
+                checkSparkAnswerAndNumOfAggregates(
+                  "SELECT covar_samp(col1, col2), covar_samp(col1, col3), covar_samp(col4, col5)," +
+                    " covar_samp(col4, col6) FROM test",
+                  expectedNumOfCometAggregates)
+                checkSparkAnswerAndNumOfAggregates(
+                  "SELECT covar_pop(col1, col2), covar_pop(col1, col3), covar_pop(col4, col5)," +
+                    " covar_pop(col4, col6) FROM test",
+                  expectedNumOfCometAggregates)
+                checkSparkAnswerAndNumOfAggregates(
+                  "SELECT covar_samp(col1, col2), covar_samp(col1, col3), covar_samp(col4, col5)," +
+                    " covar_samp(col4, col6) FROM test GROUP BY col7",
+                  expectedNumOfCometAggregates)
+                checkSparkAnswerAndNumOfAggregates(
+                  "SELECT covar_pop(col1, col2), covar_pop(col1, col3), covar_pop(col4, col5)," +
+                    " covar_pop(col4, col6) FROM test GROUP BY col7",
+                  expectedNumOfCometAggregates)
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("var_pop and var_samp") {
+    withSQLConf(CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true") {
+      Seq(true, false).foreach { cometColumnShuffleEnabled =>
+        withSQLConf(
+          CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> cometColumnShuffleEnabled.toString) {
+          Seq(true, false).foreach { dictionary =>
+            withSQLConf("parquet.enable.dictionary" -> dictionary.toString) {
+              Seq(true, false).foreach { nullOnDivideByZero =>
+                withSQLConf(
+                  "spark.sql.legacy.statisticalAggregate" -> nullOnDivideByZero.toString) {
+                  val table = "test"
+                  withTable(table) {
+                    sql(s"create table $table(col1 int, col2 int, col3 int, col4 float, col5 double, col6 int) using parquet")
+                    sql(s"insert into $table values(1, null, null, 1.1, 2.2, 1)," +
+                      " (2, null, null, 3.4, 5.6, 1), (3, null, 4, 7.9, 2.4, 2)")
+                    val expectedNumOfCometAggregates = 2
+                    checkSparkAnswerWithTolAndNumOfAggregates(
+                      "SELECT var_samp(col1), var_samp(col2), var_samp(col3), var_samp(col4), var_samp(col5) FROM test",
+                      expectedNumOfCometAggregates)
+                    checkSparkAnswerWithTolAndNumOfAggregates(
+                      "SELECT var_pop(col1), var_pop(col2), var_pop(col3), var_pop(col4), var_samp(col5) FROM test",
+                      expectedNumOfCometAggregates)
+                    checkSparkAnswerAndNumOfAggregates(
+                      "SELECT var_samp(col1), var_samp(col2), var_samp(col3), var_samp(col4), var_samp(col5)" +
+                        " FROM test GROUP BY col6",
+                      expectedNumOfCometAggregates)
+                    checkSparkAnswerAndNumOfAggregates(
+                      "SELECT var_pop(col1), var_pop(col2), var_pop(col3), var_pop(col4), var_samp(col5)" +
+                        " FROM test GROUP BY col6",
+                      expectedNumOfCometAggregates)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
   protected def checkSparkAnswerAndNumOfAggregates(query: String, numAggregates: Int): Unit = {
     val df = sql(query)
     checkSparkAnswer(df)
+    val actualNumAggregates = getNumCometHashAggregate(df)
+    assert(
+      actualNumAggregates == numAggregates,
+      s"Expected $numAggregates Comet aggregate operators, but found $actualNumAggregates")
+  }
+
+  protected def checkSparkAnswerWithTolAndNumOfAggregates(
+      query: String,
+      numAggregates: Int,
+      absTol: Double = 1e-6): Unit = {
+    val df = sql(query)
+    checkSparkAnswerWithTol(df, absTol)
     val actualNumAggregates = getNumCometHashAggregate(df)
     assert(
       actualNumAggregates == numAggregates,

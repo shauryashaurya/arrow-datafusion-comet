@@ -27,7 +27,7 @@ use arrow_schema::{DataType, Field};
 use datafusion::logical_expr::{
     type_coercion::aggregates::avg_return_type, Accumulator, EmitTo, GroupsAccumulator,
 };
-use datafusion_common::{not_impl_err, DataFusionError, Result, ScalarValue};
+use datafusion_common::{not_impl_err, Result, ScalarValue};
 use datafusion_physical_expr::{expressions::format_state_name, AggregateExpr, PhysicalExpr};
 use std::{any::Any, sync::Arc};
 
@@ -176,9 +176,15 @@ impl Accumulator for AvgAccumulator {
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        Ok(ScalarValue::Float64(
-            self.sum.map(|f| f / self.count as f64),
-        ))
+        if self.count == 0 {
+            // If all input are nulls, count will be 0 and we will get null after the division.
+            // This is consistent with Spark Average implementation.
+            Ok(ScalarValue::Float64(None))
+        } else {
+            Ok(ScalarValue::Float64(
+                self.sum.map(|f| f / self.count as f64),
+            ))
+        }
     }
 
     fn size(&self) -> usize {

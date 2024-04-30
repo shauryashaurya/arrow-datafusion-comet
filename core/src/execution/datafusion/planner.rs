@@ -23,7 +23,11 @@ use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use datafusion::{
     arrow::{compute::SortOptions, datatypes::SchemaRef},
     common::DataFusionError,
-    logical_expr::{BuiltinScalarFunction, Operator as DataFusionOperator},
+    execution::FunctionRegistry,
+    functions::math,
+    logical_expr::{
+        BuiltinScalarFunction, Operator as DataFusionOperator, ScalarFunctionDefinition,
+    },
     physical_expr::{
         execution_props::ExecutionProps,
         expressions::{
@@ -31,7 +35,6 @@ use datafusion::{
             FirstValue, InListExpr, IsNotNullExpr, IsNullExpr, LastValue,
             Literal as DataFusionLiteral, Max, Min, NegativeExpr, NotExpr, Sum, UnKnownColumn,
         },
-        functions::create_physical_expr,
         AggregateExpr, PhysicalExpr, PhysicalSortExpr, ScalarFunctionExpr,
     },
     physical_plan::{
@@ -43,9 +46,10 @@ use datafusion::{
         sorts::sort::SortExec,
         ExecutionPlan, Partitioning,
     },
+    prelude::SessionContext,
 };
 use datafusion_common::{
-    tree_node::{TreeNode, TreeNodeRewriter, VisitRecursion},
+    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter},
     JoinType as DFJoinType, ScalarValue,
 };
 use itertools::Itertools;
@@ -61,14 +65,17 @@ use crate::{
                 avg_decimal::AvgDecimal,
                 bitwise_not::BitwiseNotExpr,
                 bloom_filter_might_contain::BloomFilterMightContain,
-                cast::Cast,
+                cast::{Cast, EvalMode},
                 checkoverflow::CheckOverflow,
+                covariance::Covariance,
                 if_expr::IfExpr,
                 scalar_funcs::create_comet_physical_fun,
+                stats::StatsType,
                 strings::{Contains, EndsWith, Like, StartsWith, StringSpaceExec, SubstringExec},
                 subquery::Subquery,
                 sum_decimal::SumDecimal,
                 temporal::{DateTruncExec, HourExec, MinuteExec, SecondExec, TimestampTruncExec},
+                variance::Variance,
                 NormalizeNaNAndZero,
             },
             operators::expand::CometExpandExec,
@@ -107,20 +114,28 @@ pub struct PhysicalPlanner {
     // The execution context id of this planner.
     exec_context_id: i64,
     execution_props: ExecutionProps,
+    session_ctx: Arc<SessionContext>,
 }
 
 impl Default for PhysicalPlanner {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PhysicalPlanner {
-    pub fn new() -> Self {
+        let session_ctx = Arc::new(SessionContext::new());
         let execution_props = ExecutionProps::new();
         Self {
             exec_context_id: TEST_EXEC_CONTEXT_ID,
             execution_props,
+            session_ctx,
+        }
+    }
+}
+
+impl PhysicalPlanner {
+    pub fn new(session_ctx: Arc<SessionContext>) -> Self {
+        let execution_props = ExecutionProps::new();
+        Self {
+            exec_context_id: TEST_EXEC_CONTEXT_ID,
+            execution_props,
+            session_ctx,
         }
     }
 
@@ -128,6 +143,7 @@ impl PhysicalPlanner {
         Self {
             exec_context_id,
             execution_props: self.execution_props,
+            session_ctx: self.session_ctx.clone(),
         }
     }
 
@@ -330,7 +346,17 @@ impl PhysicalPlanner {
                 let child = self.create_expr(expr.child.as_ref().unwrap(), input_schema)?;
                 let datatype = to_arrow_datatype(expr.datatype.as_ref().unwrap());
                 let timezone = expr.timezone.clone();
-                Ok(Arc::new(Cast::new(child, datatype, timezone)))
+                let eval_mode = match expr.eval_mode.as_str() {
+                    "ANSI" => EvalMode::Ansi,
+                    "TRY" => EvalMode::Try,
+                    "LEGACY" => EvalMode::Legacy,
+                    other => {
+                        return Err(ExecutionError::GeneralError(format!(
+                            "Invalid Cast EvalMode: \"{other}\""
+                        )))
+                    }
+                };
+                Ok(Arc::new(Cast::new(child, datatype, eval_mode, timezone)))
             }
             ExprStruct::Hour(expr) => {
                 let child = self.create_expr(expr.child.as_ref().unwrap(), input_schema)?;
@@ -464,27 +490,31 @@ impl PhysicalPlanner {
             }
             ExprStruct::Abs(expr) => {
                 let child = self.create_expr(expr.child.as_ref().unwrap(), input_schema.clone())?;
+                let return_type = child.data_type(&input_schema)?;
                 let args = vec![child];
-                let expr = create_physical_expr(
-                    &BuiltinScalarFunction::Abs,
-                    &args,
-                    &input_schema,
-                    &self.execution_props,
-                )?;
-                Ok(expr)
+                let scalar_def = ScalarFunctionDefinition::UDF(math::abs());
+
+                let expr =
+                    ScalarFunctionExpr::new("abs", scalar_def, args, return_type, None, false);
+                Ok(Arc::new(expr))
             }
             ExprStruct::CaseWhen(case_when) => {
                 let when_then_pairs = case_when
                     .when
                     .iter()
-                    .map(|x| self.create_expr(x, input_schema.clone()).unwrap())
+                    .map(|x| self.create_expr(x, input_schema.clone()))
                     .zip(
                         case_when
                             .then
                             .iter()
-                            .map(|then| self.create_expr(then, input_schema.clone()).unwrap()),
+                            .map(|then| self.create_expr(then, input_schema.clone())),
                     )
-                    .collect::<Vec<_>>();
+                    .try_fold(Vec::new(), |mut acc, (a, b)| {
+                        acc.push((a?, b?));
+                        Ok::<Vec<(Arc<dyn PhysicalExpr>, Arc<dyn PhysicalExpr>)>, ExecutionError>(
+                            acc,
+                        )
+                    })?;
 
                 let else_phy_expr = match &case_when.else_expr {
                     None => None,
@@ -504,8 +534,8 @@ impl PhysicalPlanner {
                 let list = expr
                     .lists
                     .iter()
-                    .map(|x| self.create_expr(x, input_schema.clone()).unwrap())
-                    .collect::<Vec<_>>();
+                    .map(|x| self.create_expr(x, input_schema.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
 
                 // if schema contains any dictionary type, we should use InListExpr instead of
                 // in_list as it doesn't handle value being dictionary type correctly
@@ -621,13 +651,19 @@ impl PhysicalPlanner {
                 let left = Arc::new(Cast::new_without_timezone(
                     left,
                     DataType::Decimal256(p1, s1),
+                    EvalMode::Legacy,
                 ));
                 let right = Arc::new(Cast::new_without_timezone(
                     right,
                     DataType::Decimal256(p2, s2),
+                    EvalMode::Legacy,
                 ));
                 let child = Arc::new(BinaryExpr::new(left, op, right));
-                Ok(Arc::new(Cast::new_without_timezone(child, data_type)))
+                Ok(Arc::new(Cast::new_without_timezone(
+                    child,
+                    data_type,
+                    EvalMode::Legacy,
+                )))
             }
             (
                 DataFusionOperator::Divide,
@@ -637,8 +673,8 @@ impl PhysicalPlanner {
                 let data_type = return_type.map(to_arrow_datatype).unwrap();
                 let fun_expr = create_comet_physical_fun(
                     "decimal_div",
-                    &self.execution_props,
                     data_type.clone(),
+                    &self.session_ctx.state(),
                 )?;
                 Ok(Arc::new(ScalarFunctionExpr::new(
                     "decimal_div",
@@ -933,6 +969,7 @@ impl PhysicalPlanner {
                     join_params.join_on,
                     join_params.join_filter,
                     &join_params.join_type,
+                    None,
                     PartitionMode::Partitioned,
                     // null doesn't equal to null in Spark join key. If the join key is
                     // `EqualNullSafe`, Spark will rewrite it during planning.
@@ -1081,8 +1118,16 @@ impl PhysicalPlanner {
     ) -> Result<Arc<dyn AggregateExpr>, ExecutionError> {
         match spark_expr.expr_struct.as_ref().unwrap() {
             AggExprStruct::Count(expr) => {
-                let child = self.create_expr(&expr.children[0], schema)?;
-                Ok(Arc::new(Count::new(child, "count", DataType::Int64)))
+                let children = expr
+                    .children
+                    .iter()
+                    .map(|child| self.create_expr(child, schema.clone()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(Arc::new(Count::new_with_multiple_exprs(
+                    children,
+                    "count",
+                    DataType::Int64,
+                )))
             }
             AggExprStruct::Min(expr) => {
                 let child = self.create_expr(expr.child.as_ref().unwrap(), schema)?;
@@ -1167,6 +1212,54 @@ impl PhysicalPlanner {
                 let datatype = to_arrow_datatype(expr.datatype.as_ref().unwrap());
                 Ok(Arc::new(BitXor::new(child, "bit_xor", datatype)))
             }
+            AggExprStruct::CovSample(expr) => {
+                let child1 = self.create_expr(expr.child1.as_ref().unwrap(), schema.clone())?;
+                let child2 = self.create_expr(expr.child2.as_ref().unwrap(), schema.clone())?;
+                let datatype = to_arrow_datatype(expr.datatype.as_ref().unwrap());
+                Ok(Arc::new(Covariance::new(
+                    child1,
+                    child2,
+                    "covariance",
+                    datatype,
+                    StatsType::Sample,
+                )))
+            }
+            AggExprStruct::CovPopulation(expr) => {
+                let child1 = self.create_expr(expr.child1.as_ref().unwrap(), schema.clone())?;
+                let child2 = self.create_expr(expr.child2.as_ref().unwrap(), schema.clone())?;
+                let datatype = to_arrow_datatype(expr.datatype.as_ref().unwrap());
+                Ok(Arc::new(Covariance::new(
+                    child1,
+                    child2,
+                    "covariance_pop",
+                    datatype,
+                    StatsType::Population,
+                )))
+            }
+            AggExprStruct::Variance(expr) => {
+                let child = self.create_expr(expr.child.as_ref().unwrap(), schema.clone())?;
+                let datatype = to_arrow_datatype(expr.datatype.as_ref().unwrap());
+                match expr.stats_type {
+                    0 => Ok(Arc::new(Variance::new(
+                        child,
+                        "variance",
+                        datatype,
+                        StatsType::Sample,
+                        expr.null_on_divide_by_zero,
+                    ))),
+                    1 => Ok(Arc::new(Variance::new(
+                        child,
+                        "variance_pop",
+                        datatype,
+                        StatsType::Population,
+                        expr.null_on_divide_by_zero,
+                    ))),
+                    stats_type => Err(ExecutionError::GeneralError(format!(
+                        "Unknown StatisticsType {:?} for Variance",
+                        stats_type
+                    ))),
+                }
+            }
         }
     }
 
@@ -1200,14 +1293,14 @@ impl PhysicalPlanner {
         let args = expr
             .args
             .iter()
-            .map(|x| self.create_expr(x, input_schema.clone()).unwrap())
-            .collect::<Vec<_>>();
+            .map(|x| self.create_expr(x, input_schema.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
 
         let fun_name = &expr.func;
         let input_expr_types = args
             .iter()
-            .map(|x| x.data_type(input_schema.as_ref()).unwrap())
-            .collect::<Vec<_>>();
+            .map(|x| x.data_type(input_schema.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
         let data_type = match expr.return_type.as_ref().map(to_arrow_datatype) {
             Some(t) => t,
             None => {
@@ -1215,12 +1308,19 @@ impl PhysicalPlanner {
                 // scalar function
                 // Note this assumes the `fun_name` is a defined function in DF. Otherwise, it'll
                 // throw error.
-                let fun = &BuiltinScalarFunction::from_str(fun_name)?;
-                fun.return_type(&input_expr_types)?
+                let fun = BuiltinScalarFunction::from_str(fun_name);
+                if fun.is_err() {
+                    self.session_ctx
+                        .udf(fun_name)?
+                        .inner()
+                        .return_type(&input_expr_types)?
+                } else {
+                    fun?.return_type(&input_expr_types)?
+                }
             }
         };
         let fun_expr =
-            create_comet_physical_fun(fun_name, &self.execution_props, data_type.clone())?;
+            create_comet_physical_fun(fun_name, data_type.clone(), &self.session_ctx.state())?;
 
         let scalar_expr: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
             fun_name,
@@ -1287,7 +1387,7 @@ fn expr_to_columns(
                     right_field_indices.push(column.index() - left_field_len);
                 }
             }
-            VisitRecursion::Continue
+            TreeNodeRecursion::Continue
         })
     })?;
 
@@ -1323,50 +1423,51 @@ impl JoinFilterRewriter<'_> {
 }
 
 impl TreeNodeRewriter for JoinFilterRewriter<'_> {
-    type N = Arc<dyn PhysicalExpr>;
+    type Node = Arc<dyn PhysicalExpr>;
 
-    fn mutate(&mut self, node: Self::N) -> datafusion_common::Result<Self::N> {
-        let new_expr: Arc<dyn PhysicalExpr> =
-            if let Some(column) = node.as_any().downcast_ref::<Column>() {
-                if column.index() < self.left_field_len {
-                    // left side
-                    let new_index = self
-                        .left_field_indices
-                        .iter()
-                        .position(|&x| x == column.index())
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(format!(
-                                "Column index {} not found in left field indices",
-                                column.index()
-                            ))
-                        })?;
-                    Arc::new(Column::new(column.name(), new_index))
-                } else if column.index() < self.left_field_len + self.right_field_len {
-                    // right side
-                    let new_index = self
-                        .right_field_indices
-                        .iter()
-                        .position(|&x| x + self.left_field_len == column.index())
-                        .ok_or_else(|| {
-                            DataFusionError::Internal(format!(
-                                "Column index {} not found in right field indices",
-                                column.index()
-                            ))
-                        })?;
-                    Arc::new(Column::new(
-                        column.name(),
-                        new_index + self.left_field_indices.len(),
-                    ))
-                } else {
-                    return Err(DataFusionError::Internal(format!(
-                        "Column index {} out of range",
-                        column.index()
-                    )));
-                }
+    fn f_down(&mut self, node: Self::Node) -> datafusion_common::Result<Transformed<Self::Node>> {
+        if let Some(column) = node.as_any().downcast_ref::<Column>() {
+            if column.index() < self.left_field_len {
+                // left side
+                let new_index = self
+                    .left_field_indices
+                    .iter()
+                    .position(|&x| x == column.index())
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Column index {} not found in left field indices",
+                            column.index()
+                        ))
+                    })?;
+                Ok(Transformed::yes(Arc::new(Column::new(
+                    column.name(),
+                    new_index,
+                ))))
+            } else if column.index() < self.left_field_len + self.right_field_len {
+                // right side
+                let new_index = self
+                    .right_field_indices
+                    .iter()
+                    .position(|&x| x + self.left_field_len == column.index())
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Column index {} not found in right field indices",
+                            column.index()
+                        ))
+                    })?;
+                Ok(Transformed::yes(Arc::new(Column::new(
+                    column.name(),
+                    new_index + self.left_field_indices.len(),
+                ))))
             } else {
-                node.clone()
-            };
-        Ok(new_expr)
+                return Err(DataFusionError::Internal(format!(
+                    "Column index {} out of range",
+                    column.index()
+                )));
+            }
+        } else {
+            Ok(Transformed::no(node))
+        }
     }
 }
 
@@ -1387,7 +1488,7 @@ fn rewrite_physical_expr(
         right_field_indices,
     );
 
-    Ok(expr.rewrite(&mut rewriter)?)
+    Ok(expr.rewrite(&mut rewriter).data()?)
 }
 
 #[cfg(test)]
@@ -1424,7 +1525,7 @@ mod tests {
         };
 
         let op = create_filter(op_scan, 3);
-        let planner = PhysicalPlanner::new();
+        let planner = PhysicalPlanner::default();
         let row_count = 100;
 
         // Create a dictionary array with 100 values, and use it as input to the execution.
@@ -1504,7 +1605,7 @@ mod tests {
         };
 
         let op = create_filter_literal(op_scan, STRING_TYPE_ID, lit);
-        let planner = PhysicalPlanner::new();
+        let planner = PhysicalPlanner::default();
 
         let row_count = 100;
 
@@ -1582,7 +1683,7 @@ mod tests {
         };
 
         let op = create_filter(op_scan, 0);
-        let planner = PhysicalPlanner::new();
+        let planner = PhysicalPlanner::default();
 
         let (mut scans, datafusion_plan) = planner.create_plan(&op, &mut vec![]).unwrap();
 

@@ -22,9 +22,11 @@ package org.apache.spark.sql
 import scala.concurrent.duration._
 import scala.reflect.ClassTag
 import scala.reflect.runtime.universe.TypeTag
+import scala.util.Try
 
 import org.scalatest.BeforeAndAfterEach
 
+import org.apache.commons.lang3.StringUtils
 import org.apache.hadoop.fs.Path
 import org.apache.parquet.column.ParquetProperties
 import org.apache.parquet.example.data.Group
@@ -34,9 +36,9 @@ import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.schema.{MessageType, MessageTypeParser}
 import org.apache.spark._
 import org.apache.spark.internal.config.{MEMORY_OFFHEAP_ENABLED, MEMORY_OFFHEAP_SIZE, SHUFFLE_MANAGER}
-import org.apache.spark.sql.comet.{CometBatchScanExec, CometBroadcastExchangeExec, CometExec, CometScanExec, CometScanWrapper, CometSinkPlaceHolder}
+import org.apache.spark.sql.comet.{CometBatchScanExec, CometBroadcastExchangeExec, CometExec, CometRowToColumnarExec, CometScanExec, CometScanWrapper, CometSinkPlaceHolder}
 import org.apache.spark.sql.comet.execution.shuffle.{CometColumnarShuffle, CometNativeShuffle, CometShuffleExchangeExec}
-import org.apache.spark.sql.execution.{ColumnarToRowExec, InputAdapter, SparkPlan, WholeStageCodegenExec}
+import org.apache.spark.sql.execution.{ColumnarToRowExec, ExtendedMode, InputAdapter, SparkPlan, WholeStageCodegenExec}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.internal._
 import org.apache.spark.sql.test._
@@ -45,6 +47,8 @@ import org.apache.spark.sql.types.StructType
 
 import org.apache.comet._
 import org.apache.comet.CometSparkSessionExtensions.isSpark34Plus
+import org.apache.comet.shims.ShimCometSparkSessionExtensions
+import org.apache.comet.shims.ShimCometSparkSessionExtensions.supportsExtendedExplainInfo
 
 /**
  * Base class for testing. This exists in `org.apache.spark.sql` since [[SQLTestUtils]] is
@@ -54,7 +58,8 @@ abstract class CometTestBase
     extends QueryTest
     with SQLTestUtils
     with BeforeAndAfterEach
-    with AdaptiveSparkPlanHelper {
+    with AdaptiveSparkPlanHelper
+    with ShimCometSparkSessionExtensions {
   import testImplicits._
 
   protected val shuffleManager: String =
@@ -75,6 +80,7 @@ abstract class CometTestBase
     conf.set(CometConf.COMET_EXEC_ENABLED.key, "true")
     conf.set(CometConf.COMET_EXEC_ALL_OPERATOR_ENABLED.key, "true")
     conf.set(CometConf.COMET_EXEC_ALL_EXPR_ENABLED.key, "true")
+    conf.set(CometConf.COMET_ROW_TO_COLUMNAR_ENABLED.key, "true")
     conf.set(CometConf.COMET_MEMORY_OVERHEAD.key, "2g")
     conf
   }
@@ -155,9 +161,11 @@ abstract class CometTestBase
   }
 
   protected def checkCometOperators(plan: SparkPlan, excludedClasses: Class[_]*): Unit = {
-    plan.foreach {
+    val wrapped = wrapCometRowToColumnar(plan)
+    wrapped.foreach {
       case _: CometScanExec | _: CometBatchScanExec => true
       case _: CometSinkPlaceHolder | _: CometScanWrapper => false
+      case _: CometRowToColumnarExec => false
       case _: CometExec | _: CometShuffleExchangeExec => true
       case _: CometBroadcastExchangeExec => true
       case _: WholeStageCodegenExec | _: ColumnarToRowExec | _: InputAdapter => true
@@ -184,6 +192,14 @@ abstract class CometTestBase
     }
   }
 
+  /** Wraps the CometRowToColumn as ScanWrapper, so the child operators will not be checked */
+  private def wrapCometRowToColumnar(plan: SparkPlan): SparkPlan = {
+    plan.transformDown {
+      // don't care the native operators
+      case p: CometRowToColumnarExec => CometScanWrapper(null, p)
+    }
+  }
+
   /**
    * Check the answer of a Comet SQL query with Spark result using absolute tolerance.
    */
@@ -202,6 +218,41 @@ abstract class CometTestBase
     }
     val dfComet = Dataset.ofRows(spark, df.logicalPlan)
     checkAnswerWithTol(dfComet, expected, absTol: Double)
+  }
+
+  protected def checkSparkThrows(df: => DataFrame): (Throwable, Throwable) = {
+    var expected: Option[Throwable] = None
+    withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+      val dfSpark = Dataset.ofRows(spark, df.logicalPlan)
+      expected = Try(dfSpark.collect()).failed.toOption
+    }
+    val dfComet = Dataset.ofRows(spark, df.logicalPlan)
+    val actual = Try(dfComet.collect()).failed.get
+    (expected.get.getCause, actual.getCause)
+  }
+
+  protected def checkSparkAnswerAndCompareExplainPlan(
+      df: DataFrame,
+      expectedInfo: String): Unit = {
+    var expected: Array[Row] = Array.empty
+    var dfSpark: Dataset[Row] = null
+    withSQLConf(
+      CometConf.COMET_ENABLED.key -> "false",
+      "spark.sql.extendedExplainProvider" -> "") {
+      dfSpark = Dataset.ofRows(spark, df.logicalPlan)
+      expected = dfSpark.collect()
+    }
+    val dfComet = Dataset.ofRows(spark, df.logicalPlan)
+    checkAnswer(dfComet, expected)
+    val diff = StringUtils.difference(
+      dfSpark.queryExecution.explainString(ExtendedMode),
+      dfComet.queryExecution.explainString(ExtendedMode))
+    if (supportsExtendedExplainInfo(dfSpark.queryExecution)) {
+      assert(diff.contains(expectedInfo))
+    }
+    val extendedInfo =
+      new ExtendedExplainInfo().generateExtendedInfo(dfComet.queryExecution.executedPlan)
+    assert(extendedInfo.equalsIgnoreCase(expectedInfo))
   }
 
   private var _spark: SparkSession = _
@@ -717,5 +768,43 @@ abstract class CometTestBase
     } else {
       Seq.empty
     }
+  }
+
+  // tests one liner query without necessity to create external table
+  def testSingleLineQuery(
+      prepareQuery: String,
+      testQuery: String,
+      testName: String = "test",
+      tableName: String = "tbl",
+      excludedOptimizerRules: Option[String] = None): Unit = {
+
+    withTempDir { dir =>
+      val path = new Path(dir.toURI.toString, testName).toUri.toString
+      var data: java.util.List[Row] = new java.util.ArrayList()
+      var schema: StructType = null
+
+      withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+        val df = spark.sql(prepareQuery)
+        data = df.collectAsList()
+        schema = df.schema
+      }
+
+      spark.createDataFrame(data, schema).repartition(1).write.parquet(path)
+      readParquetFile(path, Some(schema)) { df => df.createOrReplaceTempView(tableName) }
+
+      withSQLConf(
+        "spark.sql.optimizer.excludedRules" -> excludedOptimizerRules.getOrElse(""),
+        "spark.sql.adaptive.optimizer.excludedRules" -> excludedOptimizerRules.getOrElse("")) {
+        checkSparkAnswerAndOperator(sql(testQuery))
+      }
+    }
+  }
+
+  def showString[T](
+      df: Dataset[T],
+      _numRows: Int,
+      truncate: Int = 20,
+      vertical: Boolean = false): String = {
+    df.showString(_numRows, truncate, vertical)
   }
 }

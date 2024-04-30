@@ -24,7 +24,7 @@ use std::{
 
 use futures::{Stream, StreamExt};
 
-use arrow_array::{ArrayRef, RecordBatch};
+use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::{DataType, Field, FieldRef, Schema, SchemaRef};
 
 use datafusion::{execution::TaskContext, physical_expr::*, physical_plan::*};
@@ -41,6 +41,7 @@ use super::copy_or_cast_array;
 pub struct CopyExec {
     input: Arc<dyn ExecutionPlan>,
     schema: SchemaRef,
+    cache: PlanProperties,
 }
 
 impl CopyExec {
@@ -59,7 +60,17 @@ impl CopyExec {
 
         let schema = Arc::new(Schema::new(fields));
 
-        Self { input, schema }
+        let cache = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            ExecutionMode::Bounded,
+        );
+
+        Self {
+            input,
+            schema,
+            cache,
+        }
     }
 }
 
@@ -82,14 +93,6 @@ impl ExecutionPlan for CopyExec {
         self.schema.clone()
     }
 
-    fn output_partitioning(&self) -> Partitioning {
-        self.input.output_partitioning()
-    }
-
-    fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        self.input.output_ordering()
-    }
-
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![self.input.clone()]
     }
@@ -103,6 +106,7 @@ impl ExecutionPlan for CopyExec {
         Ok(Arc::new(CopyExec {
             input: new_input,
             schema: self.schema.clone(),
+            cache: self.cache.clone(),
         }))
     }
 
@@ -117,6 +121,10 @@ impl ExecutionPlan for CopyExec {
 
     fn statistics(&self) -> DataFusionResult<Statistics> {
         self.input.statistics()
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.cache
     }
 }
 
@@ -141,7 +149,10 @@ impl CopyStream {
             .iter()
             .map(|v| copy_or_cast_array(v))
             .collect::<Result<Vec<ArrayRef>, _>>()?;
-        RecordBatch::try_new(self.schema.clone(), vectors).map_err(|e| arrow_datafusion_err!(e))
+
+        let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+        RecordBatch::try_new_with_options(self.schema.clone(), vectors, &options)
+            .map_err(|e| arrow_datafusion_err!(e))
     }
 }
 

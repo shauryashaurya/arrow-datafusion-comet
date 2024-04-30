@@ -17,23 +17,11 @@
  * under the License.
  */
 
-package org.apache.comet.shims
-
-import org.apache.spark.sql.comet.execution.shuffle.{CometShuffleExchangeExec, ShuffleType}
-import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
-
-trait ShimCometShuffleExchangeExec {
-  // TODO: remove after dropping Spark 3.2 and 3.3 support
-  def apply(s: ShuffleExchangeExec, shuffleType: ShuffleType): CometShuffleExchangeExec = {
-    val advisoryPartitionSize = s.getClass.getDeclaredMethods
-      .filter(_.getName == "advisoryPartitionSize")
-      .flatMap(_.invoke(s).asInstanceOf[Option[Long]])
-      .headOption
-    CometShuffleExchangeExec(
-      s.outputPartitioning,
-      s.child,
-      s.shuffleOrigin,
-      shuffleType,
-      advisoryPartitionSize)
-  }
+/// Enum used for differentiating population and sample for statistical functions
+#[derive(PartialEq, Eq, Debug, Clone, Copy)]
+pub enum StatsType {
+    /// Population
+    Population,
+    /// Sample
+    Sample,
 }

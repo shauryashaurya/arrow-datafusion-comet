@@ -76,7 +76,7 @@ class CometTPCHQuerySuite extends QueryTest with CometTPCBase with SQLQueryTestH
     "q20",
     "q21",
     "q22")
-  val disabledTpchQueries: Seq[String] = Seq("q1", "q15", "q17", "q18")
+  val disabledTpchQueries: Seq[String] = Seq()
 
   // To make output results deterministic
   def testSparkConf: SparkConf = {
@@ -91,6 +91,7 @@ class CometTPCHQuerySuite extends QueryTest with CometTPCBase with SQLQueryTestH
     conf.set(CometConf.COMET_EXEC_ALL_OPERATOR_ENABLED.key, "true")
     conf.set(CometConf.COMET_EXEC_ALL_EXPR_ENABLED.key, "true")
     conf.set(CometConf.COMET_EXEC_SHUFFLE_ENABLED.key, "true")
+    conf.set(CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key, "true")
     conf.set(MEMORY_OFFHEAP_ENABLED.key, "true")
     conf.set(MEMORY_OFFHEAP_SIZE.key, "2g")
   }

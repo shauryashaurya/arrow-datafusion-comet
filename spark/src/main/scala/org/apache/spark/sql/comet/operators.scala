@@ -19,10 +19,10 @@
 
 package org.apache.spark.sql.comet
 
-import java.io.{ByteArrayOutputStream, DataInputStream, DataOutputStream}
-import java.nio.ByteBuffer
+import java.io.{ByteArrayOutputStream, DataInputStream}
 import java.nio.channels.Channels
 
+import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
 import org.apache.spark.{SparkEnv, TaskContext}
@@ -31,23 +31,26 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression, NamedExpression, SortOrder}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, AggregateMode}
-import org.apache.spark.sql.catalyst.optimizer.BuildSide
-import org.apache.spark.sql.catalyst.plans.JoinType
-import org.apache.spark.sql.catalyst.plans.physical.Partitioning
+import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
+import org.apache.spark.sql.catalyst.plans._
+import org.apache.spark.sql.catalyst.plans.physical.{HashPartitioning, Partitioning, PartitioningCollection, UnknownPartitioning}
 import org.apache.spark.sql.comet.execution.shuffle.{ArrowReaderIterator, CometShuffleExchangeExec}
+import org.apache.spark.sql.comet.plans.PartitioningPreservingUnaryExecNode
+import org.apache.spark.sql.comet.util.Utils
 import org.apache.spark.sql.execution.{BinaryExecNode, ColumnarToRowExec, ExecSubqueryExpression, ExplainUtils, LeafExecNode, ScalarSubquery, SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.adaptive.{AQEShuffleReadExec, BroadcastQueryStageExec, ShuffleQueryStageExec}
+import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
-import org.apache.spark.util.io.{ChunkedByteBuffer, ChunkedByteBufferOutputStream}
+import org.apache.spark.util.io.ChunkedByteBuffer
 
 import com.google.common.base.Objects
 
 import org.apache.comet.{CometConf, CometExecIterator, CometRuntimeException}
 import org.apache.comet.serde.OperatorOuterClass.Operator
-import org.apache.comet.vector.NativeUtil
+import org.apache.comet.shims.ShimCometBroadcastHashJoinExec
 
 /**
  * A Comet physical operator
@@ -70,37 +73,21 @@ abstract class CometExec extends CometPlan {
 
   override def outputOrdering: Seq[SortOrder] = originalPlan.outputOrdering
 
+  // `CometExec` reuses the outputPartitioning of the original SparkPlan.
+  // Note that if the outputPartitioning of the original SparkPlan depends on its children,
+  // we should override this method in the specific CometExec, because Spark AQE may change the
+  // outputPartitioning of SparkPlan, e.g., AQEShuffleReadExec.
   override def outputPartitioning: Partitioning = originalPlan.outputPartitioning
-
-  /**
-   * Executes this Comet operator and serialized output ColumnarBatch into bytes.
-   */
-  def getByteArrayRdd(): RDD[(Long, ChunkedByteBuffer)] = {
-    executeColumnar().mapPartitionsInternal { iter =>
-      val codec = CompressionCodec.createCodec(SparkEnv.get.conf)
-      val cbbos = new ChunkedByteBufferOutputStream(1024 * 1024, ByteBuffer.allocate)
-      val out = new DataOutputStream(codec.compressedOutputStream(cbbos))
-
-      val count = new NativeUtil().serializeBatches(iter, out)
-
-      out.flush()
-      out.close()
-      if (out.size() > 0) {
-        Iterator((count, cbbos.toChunkedByteBuffer))
-      } else {
-        Iterator((count, new ChunkedByteBuffer(Array.empty[ByteBuffer])))
-      }
-    }
-  }
 
   /**
    * Executes the Comet operator and returns the result as an iterator of ColumnarBatch.
    */
   def executeColumnarCollectIterator(): (Long, Iterator[ColumnarBatch]) = {
-    val countsAndBytes = getByteArrayRdd().collect()
+    val countsAndBytes = CometExec.getByteArrayRdd(this).collect()
     val total = countsAndBytes.map(_._1).sum
     val rows = countsAndBytes.iterator
-      .flatMap(countAndBytes => CometExec.decodeBatches(countAndBytes._2))
+      .flatMap(countAndBytes =>
+        CometExec.decodeBatches(countAndBytes._2, this.getClass.getSimpleName))
     (total, rows)
   }
 }
@@ -129,9 +116,18 @@ object CometExec {
   }
 
   /**
+   * Executes this Comet operator and serialized output ColumnarBatch into bytes.
+   */
+  def getByteArrayRdd(cometPlan: CometPlan): RDD[(Long, ChunkedByteBuffer)] = {
+    cometPlan.executeColumnar().mapPartitionsInternal { iter =>
+      Utils.serializeBatches(iter)
+    }
+  }
+
+  /**
    * Decodes the byte arrays back to ColumnarBatchs and put them into buffer.
    */
-  def decodeBatches(bytes: ChunkedByteBuffer): Iterator[ColumnarBatch] = {
+  def decodeBatches(bytes: ChunkedByteBuffer, source: String): Iterator[ColumnarBatch] = {
     if (bytes.size == 0) {
       return Iterator.empty
     }
@@ -140,7 +136,7 @@ object CometExec {
     val cbbis = bytes.toInputStream()
     val ins = new DataInputStream(codec.compressedInputStream(cbbis))
 
-    new ArrowReaderIterator(Channels.newChannel(ins))
+    new ArrowReaderIterator(Channels.newChannel(ins), source)
   }
 }
 
@@ -235,12 +231,63 @@ abstract class CometNativeExec extends CometExec {
 
         // Collect the input ColumnarBatches from the child operators and create a CometExecIterator
         // to execute the native plan.
+        val sparkPlans = ArrayBuffer.empty[SparkPlan]
         val inputs = ArrayBuffer.empty[RDD[ColumnarBatch]]
 
-        foreachUntilCometInput(this)(inputs += _.executeColumnar())
+        foreachUntilCometInput(this)(sparkPlans += _)
+
+        // Find the first non broadcast plan
+        val firstNonBroadcastPlan = sparkPlans.zipWithIndex.find {
+          case (_: CometBroadcastExchangeExec, _) => false
+          case (BroadcastQueryStageExec(_, _: CometBroadcastExchangeExec, _), _) => false
+          case (BroadcastQueryStageExec(_, _: ReusedExchangeExec, _), _) => false
+          case _ => true
+        }
+
+        // If the first non broadcast plan is not found, it means all the plans are broadcast plans.
+        // This is not expected, so throw an exception.
+        if (firstNonBroadcastPlan.isEmpty) {
+          throw new CometRuntimeException(s"Cannot find the first non broadcast plan: $this")
+        }
+
+        // If the first non broadcast plan is found, we need to adjust the partition number of
+        // the broadcast plans to make sure they have the same partition number as the first non
+        // broadcast plan.
+        val firstNonBroadcastPlanRDD = firstNonBroadcastPlan.get._1.executeColumnar()
+        val firstNonBroadcastPlanNumPartitions = firstNonBroadcastPlanRDD.getNumPartitions
+
+        // Spark doesn't need to zip Broadcast RDDs, so it doesn't schedule Broadcast RDDs with
+        // same partition number. But for Comet, we need to zip them so we need to adjust the
+        // partition number of Broadcast RDDs to make sure they have the same partition number.
+        sparkPlans.zipWithIndex.foreach { case (plan, idx) =>
+          plan match {
+            case c: CometBroadcastExchangeExec =>
+              inputs += c.setNumPartitions(firstNonBroadcastPlanNumPartitions).executeColumnar()
+            case BroadcastQueryStageExec(_, c: CometBroadcastExchangeExec, _) =>
+              inputs += c.setNumPartitions(firstNonBroadcastPlanNumPartitions).executeColumnar()
+            case ReusedExchangeExec(_, c: CometBroadcastExchangeExec) =>
+              inputs += c.setNumPartitions(firstNonBroadcastPlanNumPartitions).executeColumnar()
+            case BroadcastQueryStageExec(
+                  _,
+                  ReusedExchangeExec(_, c: CometBroadcastExchangeExec),
+                  _) =>
+              inputs += c.setNumPartitions(firstNonBroadcastPlanNumPartitions).executeColumnar()
+            case _ if idx == firstNonBroadcastPlan.get._2 =>
+              inputs += firstNonBroadcastPlanRDD
+            case _ =>
+              val rdd = plan.executeColumnar()
+              if (rdd.getNumPartitions != firstNonBroadcastPlanNumPartitions) {
+                throw new CometRuntimeException(
+                  s"Partition number mismatch: ${rdd.getNumPartitions} != " +
+                    s"$firstNonBroadcastPlanNumPartitions")
+              } else {
+                inputs += rdd
+              }
+          }
+        }
 
         if (inputs.isEmpty) {
-          throw new CometRuntimeException(s"No input for CometNativeExec: $this")
+          throw new CometRuntimeException(s"No input for CometNativeExec:\n $this")
         }
 
         ZippedPartitionsRDD(sparkContext, inputs.toSeq)(createCometExecIter(_))
@@ -270,7 +317,8 @@ abstract class CometNativeExec extends CometExec {
       case _: CometScanExec | _: CometBatchScanExec | _: ShuffleQueryStageExec |
           _: AQEShuffleReadExec | _: CometShuffleExchangeExec | _: CometUnionExec |
           _: CometTakeOrderedAndProjectExec | _: CometCoalesceExec | _: ReusedExchangeExec |
-          _: CometBroadcastExchangeExec | _: BroadcastQueryStageExec =>
+          _: CometBroadcastExchangeExec | _: BroadcastQueryStageExec |
+          _: CometRowToColumnarExec =>
         func(plan)
       case _: CometPlan =>
         // Other Comet operators, continue to traverse the tree.
@@ -346,7 +394,8 @@ case class CometProjectExec(
     override val output: Seq[Attribute],
     child: SparkPlan,
     override val serializedPlanOpt: SerializedPlan)
-    extends CometUnaryExec {
+    extends CometUnaryExec
+    with PartitioningPreservingUnaryExecNode {
   override def producedAttributes: AttributeSet = outputSet
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
     this.copy(child = newChild)
@@ -365,6 +414,8 @@ case class CometProjectExec(
   }
 
   override def hashCode(): Int = Objects.hashCode(projectList, output, child)
+
+  override protected def outputExpressions: Seq[NamedExpression] = projectList
 }
 
 case class CometFilterExec(
@@ -374,6 +425,9 @@ case class CometFilterExec(
     child: SparkPlan,
     override val serializedPlanOpt: SerializedPlan)
     extends CometUnaryExec {
+
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
     this.copy(child = newChild)
 
@@ -408,6 +462,9 @@ case class CometSortExec(
     child: SparkPlan,
     override val serializedPlanOpt: SerializedPlan)
     extends CometUnaryExec {
+
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
     this.copy(child = newChild)
 
@@ -440,6 +497,9 @@ case class CometLocalLimitExec(
     child: SparkPlan,
     override val serializedPlanOpt: SerializedPlan)
     extends CometUnaryExec {
+
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
     this.copy(child = newChild)
 
@@ -467,6 +527,9 @@ case class CometGlobalLimitExec(
     child: SparkPlan,
     override val serializedPlanOpt: SerializedPlan)
     extends CometUnaryExec {
+
+  override def outputPartitioning: Partitioning = child.outputPartitioning
+
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
     this.copy(child = newChild)
 
@@ -555,7 +618,8 @@ case class CometHashAggregateExec(
     mode: Option[AggregateMode],
     child: SparkPlan,
     override val serializedPlanOpt: SerializedPlan)
-    extends CometUnaryExec {
+    extends CometUnaryExec
+    with PartitioningPreservingUnaryExecNode {
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
     this.copy(child = newChild)
 
@@ -587,6 +651,9 @@ case class CometHashAggregateExec(
 
   override def hashCode(): Int =
     Objects.hashCode(groupingExpressions, aggregateExpressions, input, mode, child)
+
+  override protected def outputExpressions: Seq[NamedExpression] =
+    originalPlan.asInstanceOf[HashAggregateExec].resultExpressions
 }
 
 case class CometHashJoinExec(
@@ -601,6 +668,18 @@ case class CometHashJoinExec(
     override val right: SparkPlan,
     override val serializedPlanOpt: SerializedPlan)
     extends CometBinaryExec {
+
+  override def outputPartitioning: Partitioning = joinType match {
+    case _: InnerLike =>
+      PartitioningCollection(Seq(left.outputPartitioning, right.outputPartitioning))
+    case LeftOuter => left.outputPartitioning
+    case RightOuter => right.outputPartitioning
+    case FullOuter => UnknownPartitioning(left.outputPartitioning.numPartitions)
+    case LeftExistence(_) => left.outputPartitioning
+    case x =>
+      throw new IllegalArgumentException(s"ShuffledJoin should not take $x as the JoinType")
+  }
+
   override def withNewChildrenInternal(newLeft: SparkPlan, newRight: SparkPlan): SparkPlan =
     this.copy(left = newLeft, right = newRight)
 
@@ -624,6 +703,9 @@ case class CometHashJoinExec(
 
   override def hashCode(): Int =
     Objects.hashCode(leftKeys, rightKeys, condition, buildSide, left, right)
+
+  override lazy val metrics: Map[String, SQLMetric] =
+    CometMetricNode.hashJoinMetrics(sparkContext)
 }
 
 case class CometBroadcastHashJoinExec(
@@ -637,7 +719,101 @@ case class CometBroadcastHashJoinExec(
     override val left: SparkPlan,
     override val right: SparkPlan,
     override val serializedPlanOpt: SerializedPlan)
-    extends CometBinaryExec {
+    extends CometBinaryExec
+    with ShimCometBroadcastHashJoinExec {
+
+  // The following logic of `outputPartitioning` is copied from Spark `BroadcastHashJoinExec`.
+  protected lazy val streamedPlan: SparkPlan = buildSide match {
+    case BuildLeft => right
+    case BuildRight => left
+  }
+
+  override lazy val outputPartitioning: Partitioning = {
+    joinType match {
+      case _: InnerLike if conf.broadcastHashJoinOutputPartitioningExpandLimit > 0 =>
+        streamedPlan.outputPartitioning match {
+          case h: HashPartitioning => expandOutputPartitioning(h)
+          case h: Expression if h.getClass.getName.contains("CoalescedHashPartitioning") =>
+            expandOutputPartitioning(h)
+          case c: PartitioningCollection => expandOutputPartitioning(c)
+          case other => other
+        }
+      case _ => streamedPlan.outputPartitioning
+    }
+  }
+
+  protected lazy val (buildKeys, streamedKeys) = {
+    require(
+      leftKeys.length == rightKeys.length &&
+        leftKeys
+          .map(_.dataType)
+          .zip(rightKeys.map(_.dataType))
+          .forall(types => types._1.sameType(types._2)),
+      "Join keys from two sides should have same length and types")
+    buildSide match {
+      case BuildLeft => (leftKeys, rightKeys)
+      case BuildRight => (rightKeys, leftKeys)
+    }
+  }
+
+  // An one-to-many mapping from a streamed key to build keys.
+  private lazy val streamedKeyToBuildKeyMapping = {
+    val mapping = mutable.Map.empty[Expression, Seq[Expression]]
+    streamedKeys.zip(buildKeys).foreach { case (streamedKey, buildKey) =>
+      val key = streamedKey.canonicalized
+      mapping.get(key) match {
+        case Some(v) => mapping.put(key, v :+ buildKey)
+        case None => mapping.put(key, Seq(buildKey))
+      }
+    }
+    mapping.toMap
+  }
+
+  // Expands the given partitioning collection recursively.
+  private def expandOutputPartitioning(
+      partitioning: PartitioningCollection): PartitioningCollection = {
+    PartitioningCollection(partitioning.partitionings.flatMap {
+      case h: HashPartitioning => expandOutputPartitioning(h).partitionings
+      case h: Expression if h.getClass.getName.contains("CoalescedHashPartitioning") =>
+        expandOutputPartitioning(h).partitionings
+      case c: PartitioningCollection => Seq(expandOutputPartitioning(c))
+      case other => Seq(other)
+    })
+  }
+
+  // Expands the given hash partitioning by substituting streamed keys with build keys.
+  // For example, if the expressions for the given partitioning are Seq("a", "b", "c")
+  // where the streamed keys are Seq("b", "c") and the build keys are Seq("x", "y"),
+  // the expanded partitioning will have the following expressions:
+  // Seq("a", "b", "c"), Seq("a", "b", "y"), Seq("a", "x", "c"), Seq("a", "x", "y").
+  // The expanded expressions are returned as PartitioningCollection.
+  private def expandOutputPartitioning(
+      partitioning: Partitioning with Expression): PartitioningCollection = {
+    val maxNumCombinations = conf.broadcastHashJoinOutputPartitioningExpandLimit
+    var currentNumCombinations = 0
+
+    def generateExprCombinations(
+        current: Seq[Expression],
+        accumulated: Seq[Expression]): Seq[Seq[Expression]] = {
+      if (currentNumCombinations >= maxNumCombinations) {
+        Nil
+      } else if (current.isEmpty) {
+        currentNumCombinations += 1
+        Seq(accumulated)
+      } else {
+        val buildKeysOpt = streamedKeyToBuildKeyMapping.get(current.head.canonicalized)
+        generateExprCombinations(current.tail, accumulated :+ current.head) ++
+          buildKeysOpt
+            .map(_.flatMap(b => generateExprCombinations(current.tail, accumulated :+ b)))
+            .getOrElse(Nil)
+      }
+    }
+
+    PartitioningCollection(
+      generateExprCombinations(getHashPartitioningLikeExpressions(partitioning), Nil)
+        .map(exprs => partitioning.withNewChildren(exprs).asInstanceOf[Partitioning]))
+  }
+
   override def withNewChildrenInternal(newLeft: SparkPlan, newRight: SparkPlan): SparkPlan =
     this.copy(left = newLeft, right = newRight)
 
@@ -661,6 +837,9 @@ case class CometBroadcastHashJoinExec(
 
   override def hashCode(): Int =
     Objects.hashCode(leftKeys, rightKeys, condition, buildSide, left, right)
+
+  override lazy val metrics: Map[String, SQLMetric] =
+    CometMetricNode.hashJoinMetrics(sparkContext)
 }
 
 case class CometSortMergeJoinExec(
@@ -674,6 +853,18 @@ case class CometSortMergeJoinExec(
     override val right: SparkPlan,
     override val serializedPlanOpt: SerializedPlan)
     extends CometBinaryExec {
+
+  override def outputPartitioning: Partitioning = joinType match {
+    case _: InnerLike =>
+      PartitioningCollection(Seq(left.outputPartitioning, right.outputPartitioning))
+    case LeftOuter => left.outputPartitioning
+    case RightOuter => right.outputPartitioning
+    case FullOuter => UnknownPartitioning(left.outputPartitioning.numPartitions)
+    case LeftExistence(_) => left.outputPartitioning
+    case x =>
+      throw new IllegalArgumentException(s"ShuffledJoin should not take $x as the JoinType")
+  }
+
   override def withNewChildrenInternal(newLeft: SparkPlan, newRight: SparkPlan): SparkPlan =
     this.copy(left = newLeft, right = newRight)
 
@@ -696,6 +887,16 @@ case class CometSortMergeJoinExec(
 
   override def hashCode(): Int =
     Objects.hashCode(leftKeys, rightKeys, condition, left, right)
+
+  override lazy val metrics: Map[String, SQLMetric] =
+    Map(
+      "input_batches" -> SQLMetrics.createMetric(sparkContext, "Number of batches consumed"),
+      "input_rows" -> SQLMetrics.createMetric(sparkContext, "Number of rows consumed"),
+      "output_batches" -> SQLMetrics.createMetric(sparkContext, "Number of batches produced"),
+      "output_rows" -> SQLMetrics.createMetric(sparkContext, "Number of rows produced"),
+      "peak_mem_used" ->
+        SQLMetrics.createSizeMetric(sparkContext, "Peak memory used for buffered data"),
+      "join_time" -> SQLMetrics.createNanoTimingMetric(sparkContext, "Total time for joining"))
 }
 
 case class CometScanWrapper(override val nativeOp: Operator, override val originalPlan: SparkPlan)

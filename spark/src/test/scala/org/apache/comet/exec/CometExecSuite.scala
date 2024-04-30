@@ -19,6 +19,9 @@
 
 package org.apache.comet.exec
 
+import java.sql.Date
+import java.time.{Duration, Period}
+
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.util.Random
@@ -32,19 +35,20 @@ import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogStatistics, CatalogTable}
 import org.apache.spark.sql.catalyst.expressions.Hex
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateMode
-import org.apache.spark.sql.comet.{CometBroadcastExchangeExec, CometCollectLimitExec, CometFilterExec, CometHashAggregateExec, CometProjectExec, CometScanExec, CometTakeOrderedAndProjectExec}
+import org.apache.spark.sql.comet.{CometBroadcastExchangeExec, CometBroadcastHashJoinExec, CometCollectLimitExec, CometFilterExec, CometHashAggregateExec, CometHashJoinExec, CometProjectExec, CometRowToColumnarExec, CometScanExec, CometSortExec, CometSortMergeJoinExec, CometTakeOrderedAndProjectExec}
 import org.apache.spark.sql.comet.execution.shuffle.{CometColumnarShuffle, CometShuffleExchangeExec}
 import org.apache.spark.sql.execution.{CollectLimitExec, ProjectExec, SQLExecution, UnionExec}
-import org.apache.spark.sql.execution.exchange.BroadcastExchangeExec
+import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.{BroadcastNestedLoopJoinExec, CartesianProductExec, SortMergeJoinExec}
 import org.apache.spark.sql.execution.window.WindowExec
-import org.apache.spark.sql.functions.{date_add, expr, sum}
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions.{col, date_add, expr, lead, sum}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.SQLConf.SESSION_LOCAL_TIMEZONE
 import org.apache.spark.unsafe.types.UTF8String
 
 import org.apache.comet.CometConf
-import org.apache.comet.CometSparkSessionExtensions.isSpark34Plus
+import org.apache.comet.CometSparkSessionExtensions.{isSpark33Plus, isSpark34Plus}
 
 class CometExecSuite extends CometTestBase {
   import testImplicits._
@@ -55,6 +59,87 @@ class CometExecSuite extends CometTestBase {
       withSQLConf(CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true") {
         testFun
       }
+    }
+  }
+
+  test("CometShuffleExchangeExec logical link should be correct") {
+    withTempView("v") {
+      spark.sparkContext
+        .parallelize((1 to 4).map(i => TestData(i, i.toString)), 2)
+        .toDF("c1", "c2")
+        .createOrReplaceTempView("v")
+
+      Seq(true, false).foreach { columnarShuffle =>
+        withSQLConf(
+          SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+          CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> columnarShuffle.toString) {
+          val df = sql("SELECT * FROM v where c1 = 1 order by c1, c2")
+          val shuffle = find(df.queryExecution.executedPlan) {
+            case _: CometShuffleExchangeExec if columnarShuffle => true
+            case _: ShuffleExchangeExec if !columnarShuffle => true
+            case _ => false
+          }.get
+          assert(shuffle.logicalLink.isEmpty)
+        }
+      }
+    }
+  }
+
+  test("Ensure that the correct outputPartitioning of CometSort") {
+    withTable("test_data") {
+      val tableDF = spark.sparkContext
+        .parallelize(
+          (1 to 10).map { i =>
+            (if (i > 4) 5 else i, i.toString, Date.valueOf(s"${2020 + i}-$i-$i"))
+          },
+          3)
+        .toDF("id", "data", "day")
+      tableDF.write.saveAsTable("test_data")
+
+      val df = sql("SELECT * FROM test_data")
+        .repartition($"data")
+        .sortWithinPartitions($"id", $"data", $"day")
+      df.collect()
+      val sort = stripAQEPlan(df.queryExecution.executedPlan).collect { case s: CometSortExec =>
+        s
+      }.head
+      assert(sort.outputPartitioning == sort.child.outputPartitioning)
+    }
+  }
+
+  test("Repeated shuffle exchange don't fail") {
+    assume(isSpark33Plus)
+    Seq("true", "false").foreach { aqeEnabled =>
+      withSQLConf(
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> aqeEnabled,
+        // `REQUIRE_ALL_CLUSTER_KEYS_FOR_DISTRIBUTION` is a new config in Spark 3.3+.
+        "spark.sql.requireAllClusterKeysForDistribution" -> "true",
+        CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "true") {
+        val df =
+          Seq(("a", 1, 1), ("a", 2, 2), ("b", 1, 3), ("b", 1, 4)).toDF("key1", "key2", "value")
+        val windowSpec = Window.partitionBy("key1", "key2").orderBy("value")
+
+        val windowed = df
+          // repartition by subset of window partitionBy keys which satisfies ClusteredDistribution
+          .repartition($"key1")
+          .select(lead($"key1", 1).over(windowSpec), lead($"value", 1).over(windowSpec))
+
+        checkSparkAnswer(windowed)
+      }
+    }
+  }
+
+  test("try_sum should return null if overflow happens before merging") {
+    assume(isSpark33Plus, "try_sum is available in Spark 3.3+")
+    val longDf = Seq(Long.MaxValue, Long.MaxValue, 2).toDF("v")
+    val yearMonthDf = Seq(Int.MaxValue, Int.MaxValue, 2)
+      .map(Period.ofMonths)
+      .toDF("v")
+    val dayTimeDf = Seq(106751991L, 106751991L, 2L)
+      .map(Duration.ofDays)
+      .toDF("v")
+    Seq(longDf, yearMonthDf, dayTimeDf).foreach { df =>
+      checkSparkAnswer(df.repartitionByRange(2, col("v")).selectExpr("try_sum(v)"))
     }
   }
 
@@ -73,7 +158,7 @@ class CometExecSuite extends CometTestBase {
 
   test("CometBroadcastExchangeExec") {
     assume(isSpark34Plus, "ChunkedByteBuffer is not serializable before Spark 3.4+")
-    withSQLConf(CometConf.COMET_EXEC_BROADCAST_ENABLED.key -> "true") {
+    withSQLConf(CometConf.COMET_EXEC_BROADCAST_FORCE_ENABLED.key -> "true") {
       withParquetTable((0 until 5).map(i => (i, i + 1)), "tbl_a") {
         withParquetTable((0 until 5).map(i => (i, i + 1)), "tbl_b") {
           val df = sql(
@@ -99,7 +184,7 @@ class CometExecSuite extends CometTestBase {
 
   test("CometBroadcastExchangeExec: empty broadcast") {
     assume(isSpark34Plus, "ChunkedByteBuffer is not serializable before Spark 3.4+")
-    withSQLConf(CometConf.COMET_EXEC_BROADCAST_ENABLED.key -> "true") {
+    withSQLConf(CometConf.COMET_EXEC_BROADCAST_FORCE_ENABLED.key -> "true") {
       withParquetTable((0 until 5).map(i => (i, i + 1)), "tbl_a") {
         withParquetTable((0 until 5).map(i => (i, i + 1)), "tbl_b") {
           val df = sql(
@@ -236,6 +321,107 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("Comet native metrics: SortMergeJoin") {
+    withSQLConf(
+      CometConf.COMET_EXEC_ENABLED.key -> "true",
+      CometConf.COMET_EXEC_ALL_OPERATOR_ENABLED.key -> "true",
+      "spark.sql.adaptive.autoBroadcastJoinThreshold" -> "-1",
+      "spark.sql.autoBroadcastJoinThreshold" -> "-1",
+      "spark.sql.join.preferSortMergeJoin" -> "true") {
+      withParquetTable((0 until 5).map(i => (i, i + 1)), "tbl1") {
+        withParquetTable((0 until 5).map(i => (i, i + 1)), "tbl2") {
+          val df = sql("SELECT * FROM tbl1 INNER JOIN tbl2 ON tbl1._1 = tbl2._1")
+          df.collect()
+
+          val metrics = find(df.queryExecution.executedPlan) {
+            case _: CometSortMergeJoinExec => true
+            case _ => false
+          }.map(_.metrics).get
+
+          assert(metrics.contains("input_batches"))
+          assert(metrics("input_batches").value == 2L)
+          assert(metrics.contains("input_rows"))
+          assert(metrics("input_rows").value == 10L)
+          assert(metrics.contains("output_batches"))
+          assert(metrics("output_batches").value == 1L)
+          assert(metrics.contains("output_rows"))
+          assert(metrics("output_rows").value == 5L)
+          assert(metrics.contains("peak_mem_used"))
+          assert(metrics("peak_mem_used").value > 1L)
+          assert(metrics.contains("join_time"))
+          assert(metrics("join_time").value > 1L)
+        }
+      }
+    }
+  }
+
+  test("Comet native metrics: HashJoin") {
+    withParquetTable((0 until 5).map(i => (i, i + 1)), "t1") {
+      withParquetTable((0 until 5).map(i => (i, i + 1)), "t2") {
+        val df = sql("SELECT /*+ SHUFFLE_HASH(t1) */ * FROM t1 INNER JOIN t2 ON t1._1 = t2._1")
+        df.collect()
+
+        val metrics = find(df.queryExecution.executedPlan) {
+          case _: CometHashJoinExec => true
+          case _ => false
+        }.map(_.metrics).get
+
+        assert(metrics.contains("build_time"))
+        assert(metrics("build_time").value > 1L)
+        assert(metrics.contains("build_input_batches"))
+        assert(metrics("build_input_batches").value == 5L)
+        assert(metrics.contains("build_mem_used"))
+        assert(metrics("build_mem_used").value > 1L)
+        assert(metrics.contains("build_input_rows"))
+        assert(metrics("build_input_rows").value == 5L)
+        assert(metrics.contains("input_batches"))
+        assert(metrics("input_batches").value == 5L)
+        assert(metrics.contains("input_rows"))
+        assert(metrics("input_rows").value == 5L)
+        assert(metrics.contains("output_batches"))
+        assert(metrics("output_batches").value == 5L)
+        assert(metrics.contains("output_rows"))
+        assert(metrics("output_rows").value == 5L)
+        assert(metrics.contains("join_time"))
+        assert(metrics("join_time").value > 1L)
+      }
+    }
+  }
+
+  test("Comet native metrics: BroadcastHashJoin") {
+    assume(isSpark34Plus, "ChunkedByteBuffer is not serializable before Spark 3.4+")
+    withParquetTable((0 until 5).map(i => (i, i + 1)), "t1") {
+      withParquetTable((0 until 5).map(i => (i, i + 1)), "t2") {
+        val df = sql("SELECT /*+ BROADCAST(t1) */ * FROM t1 INNER JOIN t2 ON t1._1 = t2._1")
+        df.collect()
+
+        val metrics = find(df.queryExecution.executedPlan) {
+          case _: CometBroadcastHashJoinExec => true
+          case _ => false
+        }.map(_.metrics).get
+
+        assert(metrics.contains("build_time"))
+        assert(metrics("build_time").value > 1L)
+        assert(metrics.contains("build_input_batches"))
+        assert(metrics("build_input_batches").value == 25L)
+        assert(metrics.contains("build_mem_used"))
+        assert(metrics("build_mem_used").value > 1L)
+        assert(metrics.contains("build_input_rows"))
+        assert(metrics("build_input_rows").value == 25L)
+        assert(metrics.contains("input_batches"))
+        assert(metrics("input_batches").value == 5L)
+        assert(metrics.contains("input_rows"))
+        assert(metrics("input_rows").value == 5L)
+        assert(metrics.contains("output_batches"))
+        assert(metrics("output_batches").value == 5L)
+        assert(metrics.contains("output_rows"))
+        assert(metrics("output_rows").value == 5L)
+        assert(metrics.contains("join_time"))
+        assert(metrics("join_time").value > 1L)
+      }
+    }
+  }
+
   test(
     "fix: ReusedExchangeExec + CometShuffleExchangeExec under QueryStageExec " +
       "should be CometRoot") {
@@ -245,6 +431,7 @@ class CometExecSuite extends CometTestBase {
     withSQLConf(
       SQLConf.EXCHANGE_REUSE_ENABLED.key -> "true",
       SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
+      SQLConf.ADAPTIVE_AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
       CometConf.COMET_EXEC_SHUFFLE_ENABLED.key -> "true",
       CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "true") {
       withTable(tableName, dim) {
@@ -1118,6 +1305,58 @@ class CometExecSuite extends CometTestBase {
       }
     })
   }
+
+  test("RowToColumnar over RangeExec") {
+    Seq("true", "false").foreach(aqe => {
+      Seq(500, 900).foreach { batchSize =>
+        withSQLConf(
+          SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> aqe,
+          SQLConf.ARROW_EXECUTION_MAX_RECORDS_PER_BATCH.key -> batchSize.toString) {
+          val df = spark.range(1000).selectExpr("id", "id % 8 as k").groupBy("k").sum("id")
+          checkSparkAnswerAndOperator(df)
+          // empty record batch should also be handled
+          val df2 = spark.range(0).selectExpr("id", "id % 8 as k").groupBy("k").sum("id")
+          checkSparkAnswerAndOperator(df2, includeClasses = Seq(classOf[CometRowToColumnarExec]))
+        }
+      }
+    })
+  }
+
+  test("RowToColumnar over RangeExec directly is eliminated for row output") {
+    Seq("true", "false").foreach(aqe => {
+      Seq(500, 900).foreach { batchSize =>
+        withSQLConf(
+          SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> aqe,
+          SQLConf.ARROW_EXECUTION_MAX_RECORDS_PER_BATCH.key -> batchSize.toString) {
+          val df = spark.range(1000)
+          val qe = df.queryExecution
+          qe.executedPlan.collectFirst({ case r: CometRowToColumnarExec => r }) match {
+            case Some(_) => fail("CometRowToColumnarExec should be eliminated")
+            case _ =>
+          }
+        }
+      }
+    })
+  }
+
+  test("RowToColumnar over InMemoryTableScanExec") {
+    Seq("true", "false").foreach(aqe => {
+      withSQLConf(
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> aqe,
+        CometConf.COMET_COLUMNAR_SHUFFLE_ENABLED.key -> "true",
+        SQLConf.CACHE_VECTORIZED_READER_ENABLED.key -> "false") {
+        spark
+          .range(1000)
+          .selectExpr("id as key", "id % 8 as value")
+          .toDF("key", "value")
+          .selectExpr("key", "value", "key+1")
+          .createOrReplaceTempView("abc")
+        spark.catalog.cacheTable("abc")
+        val df = spark.sql("SELECT * FROM abc").groupBy("key").count()
+        checkSparkAnswerAndOperator(df, includeClasses = Seq(classOf[CometRowToColumnarExec]))
+      }
+    })
+  }
 }
 
 case class BucketedTableTestSpec(
@@ -1126,3 +1365,5 @@ case class BucketedTableTestSpec(
     expectedShuffle: Boolean = true,
     expectedSort: Boolean = true,
     expectedNumOutputPartitions: Option[Int] = None)
+
+case class TestData(key: Int, value: String)

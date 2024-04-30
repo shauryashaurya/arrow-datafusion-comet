@@ -27,8 +27,7 @@ import org.apache.comet.CometConf
 class CometTPCDSQuerySuite
     extends {
       // This is private in `TPCDSBase`.
-      val excludedTpcdsQueries: Seq[String] =
-        Seq("q66", "q71", "q88", "q90", "q96")
+      val excludedTpcdsQueries: Seq[String] = Seq()
 
       // This is private in `TPCDSBase` and `excludedTpcdsQueries` is private too.
       // So we cannot override `excludedTpcdsQueries` to exclude the queries.
@@ -140,7 +139,6 @@ class CometTPCDSQuerySuite
       // TODO: enable the 3 queries after fixing the issues #1358.
       override val tpcdsQueries: Seq[String] =
         tpcdsAllQueries.filterNot(excludedTpcdsQueries.contains)
-
     }
     with TPCDSQueryTestSuite {
   override def sparkConf: SparkConf = {

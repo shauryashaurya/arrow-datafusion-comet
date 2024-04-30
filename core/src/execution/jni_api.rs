@@ -219,15 +219,11 @@ fn prepare_datafusion_session_context(
     // Get Datafusion configuration from Spark Execution context
     // can be configured in Comet Spark JVM using Spark --conf parameters
     // e.g: spark-shell --conf spark.datafusion.sql_parser.parse_float_as_decimal=true
-    let df_config = conf
-        .iter()
-        .filter(|(k, _)| k.starts_with("datafusion."))
-        .map(|kv| (kv.0.to_owned(), kv.1.to_owned()))
-        .collect::<Vec<(String, String)>>();
+    let mut session_config = SessionConfig::new().with_batch_size(batch_size);
 
-    let session_config =
-        SessionConfig::from_string_hash_map(std::collections::HashMap::from_iter(df_config))?
-            .with_batch_size(batch_size);
+    for (key, value) in conf.iter().filter(|(k, _)| k.starts_with("datafusion.")) {
+        session_config = session_config.set_str(key, value);
+    }
 
     let runtime = RuntimeEnv::new(rt_config).unwrap();
 
@@ -321,7 +317,8 @@ pub unsafe extern "system" fn Java_org_apache_comet_Native_executePlan(
         // Because we don't know if input arrays are dictionary-encoded when we create
         // query plan, we need to defer stream initialization to first time execution.
         if exec_context.root_op.is_none() {
-            let planner = PhysicalPlanner::new().with_exec_id(exec_context_id);
+            let planner = PhysicalPlanner::new(exec_context.session_ctx.clone())
+                .with_exec_id(exec_context_id);
             let (scans, root_op) = planner.create_plan(
                 &exec_context.spark_plan,
                 &mut exec_context.input_sources.clone(),
